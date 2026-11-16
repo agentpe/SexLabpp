@@ -66,20 +66,14 @@ namespace Registry::Statistics
         }
     }
 
-    namespace CustomType
-    {
-        // Tag in front of a custom statistic's value in the cosave
-        enum : int32_t
-        {
-            LegacyFloat = 0,  // older builds: the whole variant object
-            String = 1,
-            Float = 2,
-        };
-    }
+    // Tag in front of a custom statistic's value in the cosave
+    static constexpr size_t CUSTOM_FLOAT = 0;
+    static constexpr size_t CUSTOM_STRING = 1;
+    // Version 1 records hold a float as the whole variant object, behind a 4 byte tag
     static constexpr size_t LEGACY_FLOAT_SIZE = 16;
-    static_assert(sizeof(std::variant<float, RE::BSFixedString>) == LEGACY_FLOAT_SIZE, "legacy custom float entries are read by this size");
+    static_assert(sizeof(std::variant<float, RE::BSFixedString>) == LEGACY_FLOAT_SIZE, "version 1 custom floats are read by this size");
 
-    ActorStats::ActorStats(SKSE::SerializationInterface* a_intfc) :
+    ActorStats::ActorStats(SKSE::SerializationInterface* a_intfc, bool a_legacy) :
       _stats(StatisticID::Total), _custom({})
     {
         for (size_t i = 0; i < StatisticID::Total; i++) {
@@ -90,29 +84,35 @@ namespace Registry::Statistics
 
         std::string key;
         for (size_t i = 0; i < numRegs; i++) {
-            int32_t type;
-            if (!stl::read_string(a_intfc, key) || !a_intfc->ReadRecordData(type)) {
+            if (!stl::read_string(a_intfc, key)) {
+                break;
+            }
+            size_t type = 0;
+            if (a_legacy) {
+                uint32_t tag = 0;
+                if (!a_intfc->ReadRecordData(tag)) {
+                    break;
+                }
+                type = tag;
+            } else if (!a_intfc->ReadRecordData(type)) {
                 break;
             }
             switch (type) {
-            case CustomType::LegacyFloat:
-                {
-                    // Written by older builds as the raw variant object, the float sits in its first bytes
-                    std::array<char, LEGACY_FLOAT_SIZE> raw{};
-                    a_intfc->ReadRecordData(raw.data(), static_cast<uint32_t>(raw.size()));
-                    float obj;
-                    std::memcpy(&obj, raw.data(), sizeof(obj));
-                    _custom[key] = obj;
-                }
-                break;
-            case CustomType::Float:
+            case CUSTOM_FLOAT:
                 {
                     float obj = 0.0f;
-                    a_intfc->ReadRecordData(obj);
+                    if (a_legacy) {
+                        // The float sits in the first bytes of the variant object
+                        std::array<char, LEGACY_FLOAT_SIZE> raw{};
+                        a_intfc->ReadRecordData(raw.data(), static_cast<uint32_t>(raw.size()));
+                        std::memcpy(&obj, raw.data(), sizeof(obj));
+                    } else {
+                        a_intfc->ReadRecordData(obj);
+                    }
                     _custom[key] = obj;
                 }
                 break;
-            case CustomType::String:
+            case CUSTOM_STRING:
                 {
                     std::string obj;
                     stl::read_string(a_intfc, obj);
@@ -195,13 +195,13 @@ namespace Registry::Statistics
                 continue;
             }
             if (std::holds_alternative<float>(stat)) {
-                a_intfc->WriteRecordData(static_cast<int32_t>(CustomType::Float));
+                a_intfc->WriteRecordData(std::size_t{ 0 });
                 if (!a_intfc->WriteRecordData(std::get<float>(stat))) {
                     logger::error("Failed to save custom statistic {}", id);
                     continue;
                 }
             } else {
-                a_intfc->WriteRecordData(static_cast<int32_t>(CustomType::String));
+                a_intfc->WriteRecordData(std::size_t{ 1 });
                 auto save = std::get<RE::BSFixedString>(stat);
                 if (!stl::write_string(a_intfc, save)) {
                     logger::error("Failed to save custom statistic {}", id);
@@ -533,7 +533,7 @@ namespace Registry::Statistics
         logger::info("Saved {} statistics", _data.size());
     }
 
-    void StatisticsData::Load(SKSE::SerializationInterface* a_intfc)
+    void StatisticsData::Load(SKSE::SerializationInterface* a_intfc, bool a_legacy)
     {
         const std::unique_lock lock{ _m };
         _data.clear();
@@ -548,7 +548,7 @@ namespace Registry::Statistics
             }
             // Always consume the entry, else the entries behind an unresolved form are read misaligned
             try {
-                ActorStats stats{ a_intfc };
+                ActorStats stats{ a_intfc, a_legacy };
                 if (!a_intfc->ResolveFormID(formID, formID)) {
                     logger::warn("Error reading formID ({:X})", formID);
                     continue;
