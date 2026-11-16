@@ -77,7 +77,7 @@ namespace Registry::Statistics
         };
     }
     static constexpr size_t LEGACY_FLOAT_SIZE = 16;
-    static_assert(sizeof(std::variant<float, RE::BSFixedString>) == LEGACY_FLOAT_SIZE);
+    static_assert(sizeof(std::variant<float, RE::BSFixedString>) == LEGACY_FLOAT_SIZE, "legacy custom float entries are read by this size");
 
     ActorStats::ActorStats(SKSE::SerializationInterface* a_intfc) :
       _stats(StatisticID::Total), _custom({})
@@ -85,7 +85,7 @@ namespace Registry::Statistics
         for (size_t i = 0; i < StatisticID::Total; i++) {
             a_intfc->ReadRecordData(_stats[i]);
         }
-        size_t numRegs;
+        size_t numRegs = 0;
         a_intfc->ReadRecordData(numRegs);
 
         std::string key;
@@ -112,13 +112,16 @@ namespace Registry::Statistics
                     _custom[key] = obj;
                 }
                 break;
-            default:
+            case CustomType::String:
                 {
                     std::string obj;
                     stl::read_string(a_intfc, obj);
                     _custom[key] = obj;
                 }
                 break;
+            default:
+                // The value's size is unknown, so nothing behind it can be read
+                throw std::runtime_error(std::format("Unknown custom statistic type {} for '{}'", type, key));
             }
         }
     }
@@ -534,7 +537,7 @@ namespace Registry::Statistics
     {
         const std::unique_lock lock{ _m };
         _data.clear();
-        std::size_t numRegs;
+        std::size_t numRegs = 0;
         a_intfc->ReadRecordData(numRegs);
 
         RE::FormID formID;
@@ -544,12 +547,17 @@ namespace Registry::Statistics
                 break;
             }
             // Always consume the entry, else the entries behind an unresolved form are read misaligned
-            ActorStats stats{ a_intfc };
-            if (!a_intfc->ResolveFormID(formID, formID)) {
-                logger::warn("Error reading formID ({:X})", formID);
-                continue;
+            try {
+                ActorStats stats{ a_intfc };
+                if (!a_intfc->ResolveFormID(formID, formID)) {
+                    logger::warn("Error reading formID ({:X})", formID);
+                    continue;
+                }
+                _data.insert(std::make_pair(formID, std::move(stats)));
+            } catch (const std::exception& e) {
+                logger::error("Statistics of {:X} are unreadable, dropping the rest of the record: {}", formID, e.what());
+                break;
             }
-            _data.insert(std::make_pair(formID, std::move(stats)));
         }
         logger::info("Loaded {} statistics", _data.size());
     }
