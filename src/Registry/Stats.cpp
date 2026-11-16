@@ -66,6 +66,19 @@ namespace Registry::Statistics
         }
     }
 
+    namespace CustomType
+    {
+        // Tag in front of a custom statistic's value in the cosave
+        enum : int32_t
+        {
+            LegacyFloat = 0,  // older builds: the whole variant object
+            String = 1,
+            Float = 2,
+        };
+    }
+    static constexpr size_t LEGACY_FLOAT_SIZE = 16;
+    static_assert(sizeof(std::variant<float, RE::BSFixedString>) == LEGACY_FLOAT_SIZE);
+
     ActorStats::ActorStats(SKSE::SerializationInterface* a_intfc) :
       _stats(StatisticID::Total), _custom({})
     {
@@ -76,18 +89,36 @@ namespace Registry::Statistics
         a_intfc->ReadRecordData(numRegs);
 
         std::string key;
-        size_t alternative;
         for (size_t i = 0; i < numRegs; i++) {
-            stl::read_string(a_intfc, key);
-            a_intfc->ReadRecordData(alternative);
-            if (alternative == 0) {
-                float obj;
-                a_intfc->ReadRecordData(obj);
-                _custom[key] = obj;
-            } else {
-                std::string obj;
-                stl::read_string(a_intfc, obj);
-                _custom[key] = obj;
+            int32_t type;
+            if (!stl::read_string(a_intfc, key) || !a_intfc->ReadRecordData(type)) {
+                break;
+            }
+            switch (type) {
+            case CustomType::LegacyFloat:
+                {
+                    // Written by older builds as the raw variant object, the float sits in its first bytes
+                    std::array<char, LEGACY_FLOAT_SIZE> raw{};
+                    a_intfc->ReadRecordData(raw.data(), static_cast<uint32_t>(raw.size()));
+                    float obj;
+                    std::memcpy(&obj, raw.data(), sizeof(obj));
+                    _custom[key] = obj;
+                }
+                break;
+            case CustomType::Float:
+                {
+                    float obj = 0.0f;
+                    a_intfc->ReadRecordData(obj);
+                    _custom[key] = obj;
+                }
+                break;
+            default:
+                {
+                    std::string obj;
+                    stl::read_string(a_intfc, obj);
+                    _custom[key] = obj;
+                }
+                break;
             }
         }
     }
@@ -161,13 +192,13 @@ namespace Registry::Statistics
                 continue;
             }
             if (std::holds_alternative<float>(stat)) {
-                a_intfc->WriteRecordData(0);
-                if (!a_intfc->WriteRecordData(stat)) {
+                a_intfc->WriteRecordData(static_cast<int32_t>(CustomType::Float));
+                if (!a_intfc->WriteRecordData(std::get<float>(stat))) {
                     logger::error("Failed to save custom statistic {}", id);
                     continue;
                 }
             } else {
-                a_intfc->WriteRecordData(1);
+                a_intfc->WriteRecordData(static_cast<int32_t>(CustomType::String));
                 auto save = std::get<RE::BSFixedString>(stat);
                 if (!stl::write_string(a_intfc, save)) {
                     logger::error("Failed to save custom statistic {}", id);
@@ -508,12 +539,17 @@ namespace Registry::Statistics
 
         RE::FormID formID;
         for (size_t i = 0; i < numRegs; i++) {
-            a_intfc->ReadRecordData(formID);
+            if (!a_intfc->ReadRecordData(formID)) {
+                logger::warn("Statistics record ended after {} of {} entries", i, numRegs);
+                break;
+            }
+            // Always consume the entry, else the entries behind an unresolved form are read misaligned
+            ActorStats stats{ a_intfc };
             if (!a_intfc->ResolveFormID(formID, formID)) {
                 logger::warn("Error reading formID ({:X})", formID);
                 continue;
             }
-            _data.insert(std::make_pair(formID, ActorStats{ a_intfc }));
+            _data.insert(std::make_pair(formID, std::move(stats)));
         }
         logger::info("Loaded {} statistics", _data.size());
     }
